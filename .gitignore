@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+
+*.secret
+*.cookie
+*.env
+*.log
+
+data/
+run/
+logs/
+
+*.auxpow.hex
+*.candidate.json

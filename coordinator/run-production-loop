@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+BASE="/opt/vargamesh-auxpow-bridge"
+BUILDER="$BASE/coordinator/vmesh_template_builder.py"
+STATE="$BASE/data/vmesh/state/latest.json"
+
+umask 027
+
+echo "VargaMesh MergePool coordinator started"
+
+# Bei JEDEM Coordinator-Start darf kein alter latest-State
+# als frisch interpretiert werden.
+rm -f "$STATE"
+
+while true
+do
+    if "$BUILDER" --once >/dev/null 2>&1
+    then
+        :
+    else
+        echo \
+          "$(date -Is) ERROR: VMESH template refresh failed" \
+          >&2
+
+        # Fail closed.
+        rm -f "$STATE"
+    fi
+
+    sleep 2
+done

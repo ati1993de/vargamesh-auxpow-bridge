@@ -1,0 +1,1037 @@
+#!/usr/bin/env python3
+
+import hashlib
+import json
+import os
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+BASE = Path("/opt/vargamesh-auxpow-bridge")
+
+TEMPLATES = BASE / "data/vmesh/templates"
+STATE = BASE / "data/vmesh/state"
+SUBMITTED = BASE / "data/vmesh/submitted"
+
+CLI = "vargamesh-cli"
+CONF = "/etc/vargamesh-auxpow-bridge/vmesh-cli.conf"
+DATADIR = "/opt/vargamesh-auxpow-bridge/run/vmesh-cli-datadir"
+
+MAGIC = bytes.fromhex("fabe6d6d")
+
+
+def dsha(data):
+    return hashlib.sha256(
+        hashlib.sha256(data).digest()
+    ).digest()
+
+
+def varint(n):
+    if n < 0xfd:
+        return bytes([n])
+
+    if n <= 0xffff:
+        return b"\xfd" + struct.pack("<H", n)
+
+    if n <= 0xffffffff:
+        return b"\xfe" + struct.pack("<I", n)
+
+    return b"\xff" + struct.pack("<Q", n)
+
+
+def read_varint(data, pos):
+    if pos >= len(data):
+        raise RuntimeError("varint out of bounds")
+
+    n = data[pos]
+    pos += 1
+
+    if n < 0xfd:
+        return n, pos
+
+    if n == 0xfd:
+        if pos + 2 > len(data):
+            raise RuntimeError("short varint16")
+
+        return struct.unpack(
+            "<H",
+            data[pos:pos + 2]
+        )[0], pos + 2
+
+    if n == 0xfe:
+        if pos + 4 > len(data):
+            raise RuntimeError("short varint32")
+
+        return struct.unpack(
+            "<I",
+            data[pos:pos + 4]
+        )[0], pos + 4
+
+    if pos + 8 > len(data):
+        raise RuntimeError("short varint64")
+
+    return struct.unpack(
+        "<Q",
+        data[pos:pos + 8]
+    )[0], pos + 8
+
+
+def parse_tx(raw):
+    if len(raw) < 10:
+        raise RuntimeError("transaction too short")
+
+    pos = 0
+
+    version = raw[pos:pos + 4]
+    pos += 4
+
+    segwit = False
+
+    if raw[pos:pos + 2] == b"\x00\x01":
+        segwit = True
+        pos += 2
+
+    vin_count, pos = read_varint(
+        raw,
+        pos
+    )
+
+    if vin_count < 1:
+        raise RuntimeError(
+            "transaction has no inputs"
+        )
+
+    vin_serialized = bytearray()
+    scripts = []
+
+    for _ in range(vin_count):
+        if pos + 36 > len(raw):
+            raise RuntimeError(
+                "short input prevout"
+            )
+
+        prevout = raw[pos:pos + 36]
+        pos += 36
+
+        slen, pos = read_varint(
+            raw,
+            pos
+        )
+
+        if pos + slen + 4 > len(raw):
+            raise RuntimeError(
+                "short input script"
+            )
+
+        script = raw[pos:pos + slen]
+        pos += slen
+
+        sequence = raw[pos:pos + 4]
+        pos += 4
+
+        scripts.append(script)
+
+        vin_serialized += prevout
+        vin_serialized += varint(slen)
+        vin_serialized += script
+        vin_serialized += sequence
+
+    vout_count, pos = read_varint(
+        raw,
+        pos
+    )
+
+    vout_serialized = bytearray()
+
+    for _ in range(vout_count):
+        if pos + 8 > len(raw):
+            raise RuntimeError(
+                "short output value"
+            )
+
+        value = raw[pos:pos + 8]
+        pos += 8
+
+        plen, pos = read_varint(
+            raw,
+            pos
+        )
+
+        if pos + plen > len(raw):
+            raise RuntimeError(
+                "short output script"
+            )
+
+        script = raw[pos:pos + plen]
+        pos += plen
+
+        vout_serialized += value
+        vout_serialized += varint(plen)
+        vout_serialized += script
+
+    if segwit:
+        for _ in range(vin_count):
+            items, pos = read_varint(
+                raw,
+                pos
+            )
+
+            for _ in range(items):
+                size, pos = read_varint(
+                    raw,
+                    pos
+                )
+
+                if pos + size > len(raw):
+                    raise RuntimeError(
+                        "short witness item"
+                    )
+
+                pos += size
+
+    if pos + 4 != len(raw):
+        raise RuntimeError(
+            "transaction trailing/short data"
+        )
+
+    locktime = raw[pos:pos + 4]
+
+    no_witness = (
+        version
+        + varint(vin_count)
+        + bytes(vin_serialized)
+        + varint(vout_count)
+        + bytes(vout_serialized)
+        + locktime
+    )
+
+    return {
+        "segwit": segwit,
+        "scripts": scripts,
+        "txid_internal": dsha(
+            no_witness
+        ),
+        "txid":
+            dsha(
+                no_witness
+            )[::-1].hex()
+    }
+
+
+def merkle(leaf, branch, index):
+    h = leaf
+    idx = int(index)
+
+    for other in branch:
+        if len(other) != 32:
+            raise RuntimeError(
+                "merkle branch hash != 32 bytes"
+            )
+
+        if idx & 1:
+            h = dsha(
+                other + h
+            )
+        else:
+            h = dsha(
+                h + other
+            )
+
+        idx >>= 1
+
+    if idx:
+        raise RuntimeError(
+            "merkle index exceeds branch"
+        )
+
+    return h
+
+
+def build_auxpow(
+    parent_coinbase,
+    parent_branch,
+    parent_index,
+    parent_header
+):
+    # One VMESH child only:
+    #
+    # chain merkle branch = empty
+    # chain index         = 0
+    #
+    return (
+        parent_coinbase
+
+        # legacy hashBlock placeholder
+        + b"\x00" * 32
+
+        # parent coinbase merkle branch
+        + varint(
+            len(parent_branch)
+        )
+        + b"".join(
+            parent_branch
+        )
+        + struct.pack(
+            "<i",
+            int(parent_index)
+        )
+
+        # auxiliary-chain merkle branch
+        + varint(0)
+
+        # auxiliary-chain index
+        + struct.pack(
+            "<i",
+            0
+        )
+
+        # Bitcoin parent header
+        + parent_header
+    )
+
+
+def atomic_json(path, obj):
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    fd, tmp = tempfile.mkstemp(
+        prefix=path.name + ".",
+        dir=str(path.parent)
+    )
+
+    try:
+        with os.fdopen(
+            fd,
+            "w"
+        ) as f:
+            json.dump(
+                obj,
+                f,
+                sort_keys=True,
+                indent=2
+            )
+            f.write("\n")
+
+        os.chmod(
+            tmp,
+            0o640
+        )
+
+        os.replace(
+            tmp,
+            path
+        )
+
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def rpc(method, *params):
+    cmd = [
+        CLI,
+        f"-conf={CONF}",
+        f"-datadir={DATADIR}",
+        method,
+    ]
+
+    for p in params:
+        cmd.append(
+            str(p)
+        )
+
+    r = subprocess.run(
+        cmd,
+        text=True,
+        capture_output=True,
+        timeout=60
+    )
+
+    if r.returncode:
+        raise RuntimeError(
+            r.stderr.strip()
+            or r.stdout.strip()
+            or f"{method} RPC failed"
+        )
+
+    return r.stdout.strip()
+
+
+def load_template(child_hash):
+    if (
+        len(child_hash) != 64
+        or any(
+            c not in
+            "0123456789abcdefABCDEF"
+            for c in child_hash
+        )
+    ):
+        raise RuntimeError(
+            "invalid child_hash"
+        )
+
+    path = (
+        TEMPLATES
+        / (
+            child_hash.lower()
+            + ".json"
+        )
+    )
+
+    if not path.is_file():
+        raise RuntimeError(
+            "immutable child template not found: "
+            + str(path)
+        )
+
+    t = json.loads(
+        path.read_text()
+    )
+
+    if (
+        t.get("child_hash")
+        != child_hash.lower()
+    ):
+        raise RuntimeError(
+            "template child hash mismatch"
+        )
+
+    header = bytes.fromhex(
+        t["child_header"]
+    )
+
+    if len(header) != 80:
+        raise RuntimeError(
+            "VMESH header != 80 bytes"
+        )
+
+    actual = (
+        dsha(header)[::-1].hex()
+    )
+
+    if actual != child_hash.lower():
+        raise RuntimeError(
+            "VMESH header hash mismatch"
+        )
+
+    return path, t
+
+
+def inspect_candidate(candidate):
+    child_hash = str(
+        candidate.get(
+            "child_hash",
+            ""
+        )
+    ).lower()
+
+    template_path, t = load_template(
+        child_hash
+    )
+
+    parent_header = bytes.fromhex(
+        candidate[
+            "parent_header"
+        ]
+    )
+
+    if len(parent_header) != 80:
+        raise RuntimeError(
+            "Bitcoin parent header != 80 bytes"
+        )
+
+    parent_hash = (
+        dsha(
+            parent_header
+        )[::-1].hex()
+    )
+
+    advertised = candidate.get(
+        "parent_hash"
+    )
+
+    if (
+        advertised
+        and advertised.lower()
+        != parent_hash
+    ):
+        raise RuntimeError(
+            "candidate parent_hash mismatch"
+        )
+
+    parent_coinbase = bytes.fromhex(
+        candidate[
+            "parent_coinbase"
+        ]
+    )
+
+    tx = parse_tx(
+        parent_coinbase
+    )
+
+    if len(tx["scripts"]) != 1:
+        raise RuntimeError(
+            "parent coinbase must have one input"
+        )
+
+    script_sig = tx["scripts"][0]
+
+    commitment = bytes.fromhex(
+        t["commitment_hex"]
+    )
+
+    if len(commitment) != 44:
+        raise RuntimeError(
+            "VMESH commitment != 44 bytes"
+        )
+
+    if script_sig.count(MAGIC) != 1:
+        raise RuntimeError(
+            "parent coinbase must contain "
+            "exactly one merged-mining header"
+        )
+
+    if script_sig.count(
+        commitment
+    ) != 1:
+        raise RuntimeError(
+            "exact VMESH commitment missing"
+        )
+
+    branch_json = candidate.get(
+        "parent_merkle_branch"
+    )
+
+    if not isinstance(
+        branch_json,
+        list
+    ):
+        raise RuntimeError(
+            "parent_merkle_branch missing"
+        )
+
+    parent_branch = [
+        bytes.fromhex(x)
+        for x in branch_json
+    ]
+
+    parent_index = int(
+        candidate.get(
+            "parent_index",
+            0
+        )
+    )
+
+    root = merkle(
+        tx["txid_internal"],
+        parent_branch,
+        parent_index
+    )
+
+    header_root = parent_header[
+        36:68
+    ]
+
+    if root != header_root:
+        raise RuntimeError(
+            "Bitcoin parent merkle branch invalid"
+        )
+
+    target = int(
+        t["target"],
+        16
+    )
+
+    if target <= 0:
+        raise RuntimeError(
+            "invalid VMESH target"
+        )
+
+    parent_num = int(
+        parent_hash,
+        16
+    )
+
+    hit = (
+        parent_num
+        <= target
+    )
+
+    auxpow = build_auxpow(
+        parent_coinbase,
+        parent_branch,
+        parent_index,
+        parent_header
+    )
+
+    child_header = bytes.fromhex(
+        t["child_header"]
+    )
+
+    tx_vector = bytes.fromhex(
+        t["tx_vector"]
+    )
+
+    full_block = (
+        child_header
+        + auxpow
+        + tx_vector
+    )
+
+    return {
+        "template_path":
+            str(template_path),
+
+        "template":
+            t,
+
+        "parent_hash":
+            parent_hash,
+
+        "parent_coinbase_txid":
+            tx["txid"],
+
+        "target":
+            t["target"],
+
+        "target_hit":
+            hit,
+
+        "auxpow":
+            auxpow,
+
+        "full_block":
+            full_block
+    }
+
+
+def process(path, check_only=False):
+    candidate_path = Path(path)
+
+    if not candidate_path.is_file():
+        raise RuntimeError(
+            "candidate file does not exist"
+        )
+
+    candidate = json.loads(
+        candidate_path.read_text()
+    )
+
+    info = inspect_candidate(
+        candidate
+    )
+
+    t = info["template"]
+
+    print(
+        "VMESH AuxPoW candidate"
+    )
+    print(
+        "Child :",
+        t["child_hash"]
+    )
+    print(
+        "Parent:",
+        info["parent_hash"]
+    )
+    print(
+        "Target:",
+        info["target"]
+    )
+    print(
+        "Exact target hit:",
+        info["target_hit"]
+    )
+
+    if check_only:
+        print(
+            "CHECK-ONLY: no submit"
+        )
+        return 0
+
+    if not info["target_hit"]:
+        print(
+            "Exact VMESH target not reached "
+            "(CKPool 0.999 prefilter near-miss)."
+        )
+        return 0
+
+    current_tip = rpc(
+        "getbestblockhash"
+    )
+
+    if (
+        current_tip.lower()
+        != t[
+            "previousblockhash"
+        ].lower()
+    ):
+        print(
+            "STALE: VMESH tip already changed; "
+            "not submitting."
+        )
+
+        SUBMITTED.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        atomic_json(
+            SUBMITTED
+            / (
+                t["child_hash"]
+                + "-"
+                + info["parent_hash"]
+                + ".stale.json"
+            ),
+            {
+                "time":
+                    int(time.time()),
+
+                "child_hash":
+                    t["child_hash"],
+
+                "parent_hash":
+                    info["parent_hash"],
+
+                "template_prev":
+                    t[
+                        "previousblockhash"
+                    ],
+
+                "current_tip":
+                    current_tip
+            }
+        )
+
+        return 0
+
+    SUBMITTED.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    stem = (
+        t["child_hash"]
+        + "-"
+        + info["parent_hash"]
+    )
+
+    (
+        SUBMITTED
+        / (
+            stem
+            + ".auxpow.hex"
+        )
+    ).write_text(
+        info["auxpow"].hex()
+        + "\n"
+    )
+
+    (
+        SUBMITTED
+        / (
+            stem
+            + ".block.hex"
+        )
+    ).write_text(
+        info["full_block"].hex()
+        + "\n"
+    )
+
+    result = rpc(
+        "submitblock",
+        info["full_block"].hex()
+    )
+
+    record = {
+        "time":
+            int(time.time()),
+
+        "child_hash":
+            t["child_hash"],
+
+        "parent_hash":
+            info["parent_hash"],
+
+        "target":
+            t["target"],
+
+        "result":
+            result,
+
+        "accepted":
+            result in (
+                "",
+                "null"
+            )
+    }
+
+    atomic_json(
+        SUBMITTED
+        / (
+            stem
+            + ".result.json"
+        ),
+        record
+    )
+
+    print(
+        "VMESH submitblock result:",
+        repr(result)
+    )
+
+    if record["accepted"]:
+        print(
+            "VMESH BLOCK ACCEPTED"
+        )
+        return 0
+
+    print(
+        "VMESH BLOCK NOT ACCEPTED"
+    )
+
+    return 2
+
+
+def synthetic_selftest():
+    latest = json.loads(
+        (
+            STATE
+            / "latest.json"
+        ).read_text()
+    )
+
+    child_hash = latest[
+        "child_hash"
+    ]
+
+    _, t = load_template(
+        child_hash
+    )
+
+    commitment = bytes.fromhex(
+        t["commitment_hex"]
+    )
+
+    # Synthetic Bitcoin coinbase.
+    # Never submitted anywhere.
+    script_sig = (
+        b"/SELFTEST/"
+        + commitment
+    )
+
+    coinbase = (
+        struct.pack("<I", 2)
+        + b"\x01"
+        + b"\x00" * 32
+        + b"\xff" * 4
+        + varint(
+            len(script_sig)
+        )
+        + script_sig
+        + b"\xff" * 4
+        + b"\x01"
+        + struct.pack(
+            "<Q",
+            0
+        )
+        + b"\x01"
+        + b"\x51"
+        + b"\x00" * 4
+    )
+
+    tx = parse_tx(
+        coinbase
+    )
+
+    header = (
+        struct.pack(
+            "<I",
+            0x20000000
+        )
+        + b"\x00" * 32
+        + tx[
+            "txid_internal"
+        ]
+        + struct.pack(
+            "<I",
+            int(time.time())
+        )
+        + struct.pack(
+            "<I",
+            0x207fffff
+        )
+        + struct.pack(
+            "<I",
+            0
+        )
+    )
+
+    if len(header) != 80:
+        raise RuntimeError(
+            "synthetic parent header != 80"
+        )
+
+    candidate = {
+        "child_hash":
+            child_hash,
+
+        "parent_hash":
+            dsha(
+                header
+            )[::-1].hex(),
+
+        "parent_header":
+            header.hex(),
+
+        "parent_coinbase":
+            coinbase.hex(),
+
+        "parent_index":
+            0,
+
+        "parent_merkle_branch":
+            []
+    }
+
+    info = inspect_candidate(
+        candidate
+    )
+
+    if (
+        len(
+            info["auxpow"]
+        )
+        <= len(coinbase) + 80
+    ):
+        raise RuntimeError(
+            "AuxPoW serialization too short"
+        )
+
+    if not info[
+        "full_block"
+    ].startswith(
+        bytes.fromhex(
+            t["child_header"]
+        )
+    ):
+        raise RuntimeError(
+            "full block header mismatch"
+        )
+
+    print(
+        "VMESH SUBMITTER SELFTEST PASS"
+    )
+
+    print(
+        "child_hash       :",
+        child_hash
+    )
+
+    print(
+        "synthetic parent :",
+        candidate[
+            "parent_hash"
+        ]
+    )
+
+    print(
+        "parent txid      :",
+        tx["txid"]
+    )
+
+    print(
+        "auxpow bytes     :",
+        len(
+            info["auxpow"]
+        )
+    )
+
+    print(
+        "full block bytes :",
+        len(
+            info["full_block"]
+        )
+    )
+
+    print(
+        "target_hit       :",
+        info[
+            "target_hit"
+        ]
+    )
+
+    print(
+        "NO RPC SUBMIT PERFORMED"
+    )
+
+
+def main():
+    if (
+        len(sys.argv) == 2
+        and sys.argv[1]
+        == "--selftest"
+    ):
+        synthetic_selftest()
+        return 0
+
+    if (
+        len(sys.argv) == 3
+        and sys.argv[1]
+        == "--check-only"
+    ):
+        return process(
+            sys.argv[2],
+            check_only=True
+        )
+
+    if len(sys.argv) == 2:
+        return process(
+            sys.argv[1],
+            check_only=False
+        )
+
+    print(
+        "usage:",
+        file=sys.stderr
+    )
+
+    print(
+        "  vmesh-submit --selftest",
+        file=sys.stderr
+    )
+
+    print(
+        "  vmesh-submit --check-only candidate.json",
+        file=sys.stderr
+    )
+
+    print(
+        "  vmesh-submit candidate.json",
+        file=sys.stderr
+    )
+
+    return 64
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(
+            main()
+        )
+    except Exception as e:
+        print(
+            "VMESH SUBMIT ERROR:",
+            str(e),
+            file=sys.stderr
+        )
+        raise SystemExit(1)
