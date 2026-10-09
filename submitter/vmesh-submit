@@ -22,6 +22,14 @@ DATADIR = "/opt/vargamesh-auxpow-bridge/run/vmesh-cli-datadir"
 
 MAGIC = bytes.fromhex("fabe6d6d")
 
+# Independent validation: a modified/stale child template cannot silently
+# omit the mandatory VMESH developer output and still pass submission.
+VMESH_DEV_FEE_BPS = 100
+VMESH_DEV_FEE_ADDRESS = "vm1qsfsgj70pdv86nguvexzvsflmcknz4lrsj87wx9"
+VMESH_DEV_FEE_SCRIPT = bytes.fromhex(
+    "001482608979e16b0fa9a38cc984c827fbc5a62afc70"
+)
+
 
 def dsha(data):
     return hashlib.sha256(
@@ -145,6 +153,7 @@ def parse_tx(raw):
     )
 
     vout_serialized = bytearray()
+    outputs = []
 
     for _ in range(vout_count):
         if pos + 8 > len(raw):
@@ -171,6 +180,7 @@ def parse_tx(raw):
         vout_serialized += value
         vout_serialized += varint(plen)
         vout_serialized += script
+        outputs.append((struct.unpack("<Q", value)[0], script))
 
     if segwit:
         for _ in range(vin_count):
@@ -211,6 +221,8 @@ def parse_tx(raw):
     return {
         "segwit": segwit,
         "scripts": scripts,
+        "outputs": outputs,
+        "no_witness": no_witness,
         "txid_internal": dsha(
             no_witness
         ),
@@ -365,6 +377,43 @@ def rpc(method, *params):
     return r.stdout.strip()
 
 
+def validate_child_fee(t):
+    """Fail closed unless the *serialized* child reward pays the 1% fee."""
+    total = t.get("coinbasevalue")
+    if type(total) is not int or total <= 0:
+        raise RuntimeError("invalid VMESH coinbasevalue")
+    fee = total * VMESH_DEV_FEE_BPS // 10000
+    if fee <= 0 or fee >= total:
+        raise RuntimeError("VMESH reward too small for mandatory fee")
+
+    if (t.get("developer_fee_bps") != VMESH_DEV_FEE_BPS
+            or t.get("developer_fee_address") != VMESH_DEV_FEE_ADDRESS
+            or t.get("developer_fee_value") != fee
+            or t.get("developer_fee_scriptPubKey") !=
+                VMESH_DEV_FEE_SCRIPT.hex()):
+        raise RuntimeError("VMESH developer fee metadata mismatch")
+
+    coinbase = bytes.fromhex(t["coinbase"])
+    parsed = parse_tx(coinbase)
+    if (not parsed["segwit"] or len(parsed["scripts"]) != 1
+            or parsed["no_witness"].hex() != t["coinbase_no_witness"]
+            or parsed["txid"] != t["coinbase_txid"]):
+        raise RuntimeError("VMESH coinbase serialization mismatch")
+
+    expected = [
+        (total - fee, bytes.fromhex(t["vmesh_scriptPubKey"])),
+        (fee, VMESH_DEV_FEE_SCRIPT),
+        (0, bytes.fromhex(t["witness_commitment"]))
+    ]
+    if parsed["outputs"] != expected:
+        raise RuntimeError("mandatory VMESH 1% developer output missing")
+
+    vector = bytes.fromhex(t["tx_vector"])
+    prefix = varint(int(t["tx_count"])) + coinbase
+    if int(t["tx_count"]) < 1 or not vector.startswith(prefix):
+        raise RuntimeError("VMESH transaction vector does not match coinbase")
+
+
 def load_template(child_hash):
     if (
         len(child_hash) != 64
@@ -422,6 +471,7 @@ def load_template(child_hash):
             "VMESH header hash mismatch"
         )
 
+    validate_child_fee(t)
     return path, t
 
 

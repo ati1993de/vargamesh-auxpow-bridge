@@ -14,6 +14,10 @@ DATADIR="/opt/vargamesh-auxpow-bridge/run/vmesh-cli-datadir"
 
 CHAIN_ID=22093
 
+# Fixed mainnet developer fee. Not configurable via pool.env.
+VMESH_DEV_FEE_BPS=100  # 1.00%, integer basis points
+VMESH_DEV_FEE_ADDRESS="vm1qsfsgj70pdv86nguvexzvsflmcknz4lrsj87wx9"
+
 DIFF1=0x00000000FFFF0000000000000000000000000000000000000000000000000000
 
 CHARSET="qpzry9x8gf2tvdw0s3jn54khce6mua7l"
@@ -392,6 +396,16 @@ def get_gbt():
     return g
 
 
+def split_mining_reward(coinbasevalue):
+    """Return (miner, developer) using integer base units; never float."""
+    if type(coinbasevalue) is not int or coinbasevalue <= 0:
+        raise RuntimeError("invalid VMESH coinbasevalue")
+    fee = coinbasevalue * VMESH_DEV_FEE_BPS // 10000
+    if fee <= 0 or fee >= coinbasevalue:
+        raise RuntimeError("VMESH reward too small for mandatory 1% fee")
+    return coinbasevalue - fee, fee
+
+
 def build():
     payout = env().get(
         "VMESH_PAYOUT_ADDRESS",
@@ -406,8 +420,13 @@ def build():
     spk = segwit_script(
         payout
     )
+    dev_spk = segwit_script(
+        VMESH_DEV_FEE_ADDRESS
+    )
 
     g = get_gbt()
+    reward = int(g["coinbasevalue"])
+    miner_reward, developer_reward = split_mining_reward(reward)
 
     height = int(
         g["height"]
@@ -456,18 +475,16 @@ def build():
         g["default_witness_commitment"]
     )
 
+    # Child-chain VMESH fee is paid directly in the child coinbase,
+    # independently of the Bitcoin parent coinbase developer output.
     outputs = (
-        varint(2)
-        + struct.pack(
-            '<Q',
-            int(
-                g["coinbasevalue"]
-            )
-        )
-        + varint(
-            len(spk)
-        )
+        varint(3)
+        + struct.pack('<Q', miner_reward)
+        + varint(len(spk))
         + spk
+        + struct.pack('<Q', developer_reward)
+        + varint(len(dev_spk))
+        + dev_spk
         + struct.pack(
             '<Q',
             0
@@ -646,6 +663,12 @@ def build():
         "vmesh_scriptPubKey":
             spk.hex(),
 
+        "developer_fee_bps": VMESH_DEV_FEE_BPS,
+        "developer_fee_address": VMESH_DEV_FEE_ADDRESS,
+        "developer_fee_scriptPubKey": dev_spk.hex(),
+        "developer_fee_value": developer_reward,
+        "miner_coinbase_value": miner_reward,
+
         "coinbase_scriptSig":
             script_sig.hex(),
 
@@ -707,7 +730,12 @@ def build():
             "child_header",
             "tx_vector",
             "target",
-            "vmesh_scriptPubKey"
+            "vmesh_scriptPubKey",
+            "developer_fee_bps",
+            "developer_fee_address",
+            "developer_fee_scriptPubKey",
+            "developer_fee_value",
+            "miner_coinbase_value"
         ):
             if (
                 old.get(key)
@@ -752,7 +780,10 @@ def build():
             int(time.time()),
 
         "commitment_hex":
-            obj["commitment_hex"]
+            obj["commitment_hex"],
+
+        "developer_fee_bps": VMESH_DEV_FEE_BPS,
+        "developer_fee_address": VMESH_DEV_FEE_ADDRESS
     }
 
     atomic_json(
@@ -817,6 +848,14 @@ def selftest():
         raise RuntimeError(
             "commitment != 44 bytes"
         )
+
+    if (template.get("developer_fee_bps") != VMESH_DEV_FEE_BPS
+            or template.get("developer_fee_address") != VMESH_DEV_FEE_ADDRESS):
+        raise RuntimeError("mandatory VMESH developer fee metadata missing")
+
+    if (template.get("developer_fee_value") !=
+            split_mining_reward(int(template["coinbasevalue"]))[1]):
+        raise RuntimeError("VMESH developer fee amount mismatch")
 
     print(
         "VMESH TEMPLATE SELFTEST PASS"
