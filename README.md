@@ -54,3 +54,7 @@ VargaMesh: https://vargacoin.com/
 VargaMesh Core: https://github.com/ati1993de/vargamesh-core
 
 License: MIT. See `LICENSE`.
+
+## Optional pool compatibility JSON-RPC
+
+A loopback-only Basic-authenticated `getauxblock`/`submitauxblock` compatibility adapter is available in `compat/auxrpc.py`. See [integration guide](docs/COMPAT-AUXRPC.md). The existing fixed-fee bridge implementation remains unchanged.
