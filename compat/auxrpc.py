@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SUBMITTER = runpy.run_path(str(ROOT / "submitter" / "vmesh-submit"))
 STATE = Path(os.environ.get("VMESH_AUXRPC_STATE", "/opt/vargamesh-auxpow-bridge/data/vmesh/state/latest.json"))
-MAX_BODY = 65536
+MAX_BODY = 600000
 MAX_AUXPOW_BYTES = 256 * 1024
 HASH_RE = re.compile(r"^[a-fA-F0-9]{64}$")
 
