@@ -16,4 +16,4 @@ jobs:
       - name: VMESH 1% output, tamper and serialization tests
         run: python -m unittest discover -s tests -v
       - name: Compile Python tools
-        run: python -m py_compile coordinator/vmesh_template_builder.py submitter/vmesh-submit
+        run: python -m py_compile coordinator/vmesh_template_builder.py submitter/vmesh-submit compat/auxrpc.py
